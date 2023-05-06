@@ -1,0 +1,551 @@
+# 设备模型uevent
+
+Linux-4.9.88
+
+ref:http://www.wowotech.net/device_model
+
+## Uevent
+
+Uevent是Kobject的一部分，用于在Kobject状态发生改变时，例如增加、移除等，通知用户空间程序。用户空间程序收到这样的事件后，会做相应的处理。
+
+该机制通常是用来支持热拔插设备的，例如U盘插入后，USB相关的驱动软件会动态创建用于表示该U盘的device结构（相应的也包括其中的kobject），并告知用户空间程序，为该U盘动态的创建/dev/目录下的设备节点，更进一步，可以通知其它的应用程序，将该U盘设备mount到系统中，从而动态的支持该设备。
+
+![image-20230427194427894](https://gitee.com/zhanghang1999/typora-picture/raw/master/image-20230427194427894.png)
+
+以下是来自gpt-3.5的解释：
+
+Linux内核uevent是一种事件机制，用于通知用户空间应用程序关于硬件设备的状态变化。当一个硬件设备的状态发生变化时，内核会生成一个uevent，并将其发送到用户空间，用户空间应用程序可以通过监听uevent来获取硬件设备的状态变化信息。
+
+uevent的作用是让用户空间应用程序能够实时地监测硬件设备的状态变化，比如插拔USB设备、网络设备状态变化等。这使得用户空间应用程序能够及时地对硬件设备的状态进行响应和管理。另外，uevent还提供了一种机制，让用户空间应用程序能够对硬件设备进行动态配置和管理，比如加载和卸载驱动程序、配置网络接口等。
+
+总之，Linux内核uevent是一个非常重要的事件机制，可以让用户空间应用程序实时监测和管理硬件设备的状态变化，从而提高系统的可用性和稳定性。
+
+## kobject_uevent
+
+负责上报uevent的函数是kobject_uevent，kobject字样的函数一般都是比较底层的函数，不会直接调用，通常封装使用，如device_add函数中会调用kobject_uevent，以下是kobject_uevent的源码：
+
+```cpp
+//lib/kobject.c
+int kobject_uevent(struct kobject *kobj, enum kobject_action action)
+{
+    return kobject_uevent_env(kobj, action, NULL);
+}
+//include/linux/kobject.h
+enum kobject_action {
+    KOBJ_ADD,//Kobject（或上层数据结构）的添加/移除事件。
+    KOBJ_REMOVE,//同上
+    KOBJ_CHANGE,//Kobject（或上层数据结构）的状态或者内容发生改变。
+    KOBJ_MOVE,//更改名称或者更改Parent（意味着在sysfs中更改了目录结构）
+    KOBJ_ONLINE,//Kobject（或上层数据结构）的上线/下线事件，其实是是否使能。
+    KOBJ_OFFLINE,//同上
+    KOBJ_MAX
+};
+```
+
+主要实现函数是kobject_uevent_env，这个函数相比kobject_uevent可以传入一个字符串数组添加自己的环境变量串:
+
+```cpp
+int kobject_uevent_env(struct kobject *kobj, enum kobject_action action,
+               char *envp_ext[])
+{
+    struct kobj_uevent_env *env;
+    const char *action_string = kobject_actions[action];
+    const char *devpath = NULL;
+    const char *subsystem;
+    struct kobject *top_kobj;
+    struct kset *kset;
+    const struct kset_uevent_ops *uevent_ops;
+    int i = 0;
+    int retval = 0;
+#ifdef CONFIG_NET
+    struct uevent_sock *ue_sk;
+#endif
+
+
+    pr_debug("kobject: '%s' (%p): %s\n",
+         kobject_name(kobj), kobj, __func__);
+
+
+    /* search the kset we belong to */
+    top_kobj = kobj;
+    /*找到顶层的kset，这里是devices目录的kset*/
+    while (!top_kobj->kset && top_kobj->parent)
+        top_kobj = top_kobj->parent;
+
+
+    if (!top_kobj->kset) {
+        pr_debug("kobject: '%s' (%p): %s: attempted to send uevent "
+             "without kset!\n", kobject_name(kobj), kobj,
+             __func__);
+        return -EINVAL;
+    }
+
+
+    kset = top_kobj->kset;
+     /*kset->uevent_ops在devices_init时被设置：device_uevent_ops*/
+    uevent_ops = kset->uevent_ops;
+
+
+    /* skip the event, if uevent_suppress is set*/
+    if (kobj->uevent_suppress) {
+        pr_debug("kobject: '%s' (%p): %s: uevent_suppress "
+                 "caused the event to drop!\n",
+                 kobject_name(kobj), kobj, __func__);
+        return 0;
+    }
+    /* skip the event, if the filter returns zero. */
+    if (uevent_ops && uevent_ops->filter)
+        if (!uevent_ops->filter(kset, kobj)) {
+            pr_debug("kobject: '%s' (%p): %s: filter function "
+                 "caused the event to drop!\n",
+                 kobject_name(kobj), kobj, __func__);
+            return 0;
+        }
+
+
+    /* originating subsystem */
+    /*获取子系统名*/
+    if (uevent_ops && uevent_ops->name)
+        subsystem = uevent_ops->name(kset, kobj);
+    else
+        subsystem = kobject_name(&kset->kobj);
+    if (!subsystem) {
+        pr_debug("kobject: '%s' (%p): %s: unset subsystem caused the "
+             "event to drop!\n", kobject_name(kobj), kobj,
+             __func__);
+        return 0;
+    }
+
+
+    /* environment buffer */
+    /*分配环境变量内存*/
+    env = kzalloc(sizeof(struct kobj_uevent_env), GFP_KERNEL);
+    if (!env)
+        return -ENOMEM;
+
+
+    /* complete object path */
+    /*获取kobj的绝对路径*/
+    devpath = kobject_get_path(kobj, GFP_KERNEL);
+    if (!devpath) {
+        retval = -ENOENT;
+        goto exit;
+    }
+
+
+    /* default keys */
+    /*添加环境变量到env*/
+    retval = add_uevent_var(env, "ACTION=%s", action_string);
+    if (retval)
+        goto exit;
+    retval = add_uevent_var(env, "DEVPATH=%s", devpath);
+    if (retval)
+        goto exit;
+    retval = add_uevent_var(env, "SUBSYSTEM=%s", subsystem);
+    if (retval)
+        goto exit;
+
+
+    /* keys passed in from the caller */
+    if (envp_ext) {
+        for (i = 0; envp_ext[i]; i++) {
+            retval = add_uevent_var(env, "%s", envp_ext[i]);
+            if (retval)
+                goto exit;
+        }
+    }
+
+
+    /* let the kset specific function add its stuff */
+    if (uevent_ops && uevent_ops->uevent) {
+        retval = uevent_ops->uevent(kset, kobj, env);
+        if (retval) {
+            pr_debug("kobject: '%s' (%p): %s: uevent() returned "
+                 "%d\n", kobject_name(kobj), kobj,
+                 __func__, retval);
+            goto exit;
+        }
+    }
+
+
+    /*
+     * Mark "add" and "remove" events in the object to ensure proper
+     * events to userspace during automatic cleanup. If the object did
+     * send an "add" event, "remove" will automatically generated by
+     * the core, if not already done by the caller.
+     */
+    if (action == KOBJ_ADD)
+        kobj->state_add_uevent_sent = 1;
+    else if (action == KOBJ_REMOVE)
+        kobj->state_remove_uevent_sent = 1;
+
+
+    mutex_lock(&uevent_sock_mutex);
+    /* we will send an event, so request a new sequence number */
+    retval = add_uevent_var(env, "SEQNUM=%llu", (unsigned long long)++uevent_seqnum);
+    if (retval) {
+        mutex_unlock(&uevent_sock_mutex);
+        goto exit;
+    }
+
+
+#if defined(CONFIG_NET)
+    /* send netlink message */
+    list_for_each_entry(ue_sk, &uevent_sock_list, list) {
+        struct sock *uevent_sock = ue_sk->sk;
+        struct sk_buff *skb;
+        size_t len;
+
+
+        if (!netlink_has_listeners(uevent_sock, 1))
+            continue;
+
+
+        /* allocate message with the maximum possible size */
+        len = strlen(action_string) + strlen(devpath) + 2;
+        skb = alloc_skb(len + env->buflen, GFP_KERNEL);
+        if (skb) {
+            char *scratch;
+
+
+            /* add header */
+            scratch = skb_put(skb, len);
+            sprintf(scratch, "%s@%s", action_string, devpath);
+
+
+            /* copy keys to our continuous event payload buffer */
+            for (i = 0; i < env->envp_idx; i++) {
+                len = strlen(env->envp[i]) + 1;
+                scratch = skb_put(skb, len);
+                strcpy(scratch, env->envp[i]);
+            }
+
+
+            NETLINK_CB(skb).dst_group = 1;
+            retval = netlink_broadcast_filtered(uevent_sock, skb,
+                                0, 1, GFP_KERNEL,
+                                kobj_bcast_filter,
+                                kobj);
+            /* ENOBUFS should be handled in userspace */
+            if (retval == -ENOBUFS || retval == -ESRCH)
+                retval = 0;
+        } else
+            retval = -ENOMEM;
+    }
+#endif
+    mutex_unlock(&uevent_sock_mutex);
+
+
+#ifdef CONFIG_UEVENT_HELPER
+    /* call uevent_helper, usually only enabled during early boot */
+    if (uevent_helper[0] && !kobj_usermode_filter(kobj)) {
+        struct subprocess_info *info;
+        /*这里是几个熟悉的环境变量*/
+        retval = add_uevent_var(env, "HOME=/");
+        if (retval)
+            goto exit;
+        retval = add_uevent_var(env,
+                    "PATH=/sbin:/bin:/usr/sbin:/usr/bin");
+        if (retval)
+            goto exit;
+        /*初始化env的argv[]*/
+        retval = init_uevent_argv(env, subsystem);
+        if (retval)
+            goto exit;
+
+
+        retval = -ENOMEM;
+        /*初始化工作队列，设置工作队列函数，传入用户空间命令和参数以及回调函数*/
+        info = call_usermodehelper_setup(env->argv[0], env->argv,
+                         env->envp, GFP_KERNEL,
+                         NULL, cleanup_uevent_env, env);
+        if (info) {
+        /*启动工作队列，接下来用户空间会调用/sbin/mdev*/
+            retval = call_usermodehelper_exec(info, UMH_NO_WAIT);
+            env = NULL;    /* freed by cleanup_uevent_env */
+        }
+    }
+#endif
+
+
+exit:
+    kfree(devpath);
+    kfree(env);
+    return retval;
+}
+EXPORT_SYMBOL_GPL(kobject_uevent_env);
+```
+
+结构体kobj_uevent_env:
+
+```cpp
+//include/linux/kobject.h
+
+#define UEVENT_NUM_ENVP            32    /* number of env pointers */
+#define UEVENT_BUFFER_SIZE        2048    /* buffer for the variables */
+
+struct kobj_uevent_env {
+    char *argv[3];
+    char *envp[UEVENT_NUM_ENVP];//指针数组，用于保存每个环境变量的地址，最多可支持的环境变量数量为UEVENT_NUM_ENVP。
+    int envp_idx;//用于访问环境变量指针数组的index。
+    char buf[UEVENT_BUFFER_SIZE];//保存环境变量的buffer，最大为UEVENT_BUFFER_SIZE。
+    int buflen;//访问buf的变量。
+};
+//buf保存所有环境变量，而envp分开保存各个环境变量，项数为envp_idx。
+```
+
+`int add_uevent_var(struct kobj_uevent_env *env, const char *format, ...)`向env中添加一个环境变量。
+
+`init_uevent_argv`设置env->argv[0]为用户层调用的应用程序，这里设置为`uevent_helper`全局变量。设置env->argv[1]为调用uevent_ops->name或者kobject_name的结果。
+
+`call_usermodehelper_setup`如下：
+
+```cpp
+info = call_usermodehelper_setup(env->argv[0], env->argv,
+						 env->envp, GFP_KERNEL,
+						 NULL, cleanup_uevent_env, env);
+
+struct subprocess_info *call_usermodehelper_setup(char *path, char **argv,
+		char **envp, gfp_t gfp_mask,
+		int (*init)(struct subprocess_info *info, struct cred *new),
+		void (*cleanup)(struct subprocess_info *info),
+		void *data)
+{
+	struct subprocess_info *sub_info;
+	sub_info = kzalloc(sizeof(struct subprocess_info), gfp_mask);
+	if (!sub_info)
+		goto out;
+
+	INIT_WORK(&sub_info->work, call_usermodehelper_exec_work);//初始化工作队列
+	sub_info->path = path;//env->argv[0]即event_helper
+	sub_info->argv = argv;
+	sub_info->envp = envp;//环境变量集合
+
+	sub_info->cleanup = cleanup;
+	sub_info->init = init;
+	sub_info->data = data;
+  out:
+	return sub_info;
+}
+```
+
+`call_usermodehelper_exec`启动工作队列，将执行工作队列函数，此函数最后会调用do_execve在用户空间执行程序：
+
+```cpp
+retval = do_execve(getname_kernel(sub_info->path),
+			   (const char __user *const __user *)sub_info->argv,
+			   (const char __user *const __user *)sub_info->envp);
+```
+
+kobject_uevent执行步骤：
+
+1. 找到kobject所属的kset，获取kset->uevent_ops
+2. 判断kobj->uevent_suppress是否置位，是的话将不发送uevent
+3. 调用uevent_ops->filter进行过滤，被过滤将不发送uevent
+4. 调用uevent_ops->name获取subsystem name
+5. 分配环境变量内存
+6. 获取kobj的绝对路径
+7. 添加环境变量到env，包括绝对路径，subsystem name
+8. 调用uevent_ops->uevent
+9. 调用call_usermodehelper_setup ，初始化工作队列，设置工作队列函数，传入用户空间命令和参数以及回调函数
+10. 调用call_usermodehelper_exec，启动工作队列，接下来用户空间会调用如/sbin/mdev..
+
+向用户空间上报event事件时，会直接执行用户空间的可执行文件。而在Linux系统，可执行文件的执行，依赖于环境变量，因此kobj_uevent_env用于组织此次事件上报时的环境变量。
+
+以下解释来自wowo:
+
+> kobject_uevent_env，以envp为环境变量，上报一个指定action的uevent。环境变量的作用是为执行用户空间程序指定运行环境。具体动作如下：
+>
+> 1. 查找kobj本身或者其parent是否从属于某个kset，如果不是，则报错返回（如果一个kobject没有加入kset，是不允许上报uevent的）
+> 2. 查看kobj->uevent_suppress是否设置，如果设置，则忽略所有的uevent上报并返回（可以通过Kobject的uevent_suppress标志，管控Kobject的uevent的上报）
+> 3. 如果所属的kset有uevent_ops->filter函数，则调用该函数，过滤此次上报（kset可以通过filter接口过滤不希望上报的event，从而达到整体的管理效果）
+> 4. 判断所属的kset是否有合法的名称（称作subsystem，和前期的内核版本有区别），否则不允许上报uevent
+> 5. 分配一个用于此次上报的、存储环境变量的buffer（结果保存在env指针中），并获得该Kobject在sysfs中路径信息（用户空间软件需要依据该路径信息在sysfs中访问它）
+> 6. 调用add_uevent_var接口（下面会介绍），将Action、路径信息、subsystem等信息，添加到env指针中
+> 7. 如果传入的envp不空，则解析传入的环境变量中，同样调用add_uevent_var接口，添加到env指针中
+> 8. 如果所属的kset存在uevent_ops->uevent接口，调用该接口，添加kset统一的环境变量到env指针
+> 9. 根据ACTION的类型，设置kobj->state_add_uevent_sent和kobj->state_remove_uevent_sent变量，以记录正确的状态
+> 10. 调用add_uevent_var接口，添加格式为"SEQNUM=%llu”的序列号
+> 11. 如果定义了"CONFIG_NET”，则使用netlink发送该uevent
+> 12. 以uevent_helper、subsystem以及添加了标准环境变量（HOME=/，PATH=/sbin:/bin:/usr/sbin:/usr/bin）的env指针为参数，调用kmod模块提供的call_usermodehelper函数，上报uevent。
+>
+>  其中uevent_helper的内容是由内核配置项CONFIG_UEVENT_HELPER_PATH(位于./drivers/base/Kconfig)决定的(可参考lib/kobject_uevent.c, line 32)，该配置项指定了一个用户空间程序（或者脚本），用于解析上报的uevent，例如"/sbin/hotplug”。call_usermodehelper的作用，就是fork一个进程，以uevent为参数，执行uevent_helper。
+
+## device uevent
+
+以/sys/devices目录的为例，在/drivers/base/core.c中的devices_init函数中，会在/sys/目录下创建devices目录，该目录通过kset_create_add_add创建，并提供了一个uevent操作集：
+
+```cpp
+int __init devices_init(void)
+{
+	devices_kset = kset_create_and_add("devices", &device_uevent_ops, NULL);
+	if (!devices_kset)
+		return -ENOMEM;
+	//...
+}
+
+static const struct kset_uevent_ops device_uevent_ops = {
+	.filter =	dev_uevent_filter,
+	.name =		dev_uevent_name,
+	.uevent =	dev_uevent,
+};
+```
+
+### dev_uevent_filter
+
+```cpp
+static int dev_uevent_filter(struct kset *kset, struct kobject *kobj)
+{
+    struct kobj_type *ktype = get_ktype(kobj);
+
+	//该filter接口只处理kobject->ktype为device_ktype，且绑定了bus或者class的device
+    if (ktype == &device_ktype) {
+        struct device *dev = kobj_to_dev(kobj);
+        if (dev->bus)
+            return 1;
+        if (dev->class)
+            return 1;
+    }
+    return 0;
+}
+```
+
+当任何Kobject需要上报uevent时，它所属的kset可以通过该接口过滤，阻止不希望上报的event，从而达到从整体上管理的目的。
+
+### dev_uevent_name
+
+```cpp
+static const char *dev_uevent_name(struct kset *kset, struct kobject *kobj)
+{
+    struct device *dev = kobj_to_dev(kobj);
+
+
+    if (dev->bus)
+        return dev->bus->name;
+    if (dev->class)
+        return dev->class->name;
+    return NULL;
+}
+```
+
+返回device对应的bus名或class名，优先返回bus名
+
+### dev_uevent
+
+```cpp
+static int dev_uevent(struct kset *kset, struct kobject *kobj,
+              struct kobj_uevent_env *env)
+{
+    struct device *dev = kobj_to_dev(kobj);
+    int retval = 0;
+
+
+    /* add device node properties if present */
+    if (MAJOR(dev->devt)) {
+        const char *tmp;
+        const char *name;
+        umode_t mode = 0;
+        kuid_t uid = GLOBAL_ROOT_UID;
+        kgid_t gid = GLOBAL_ROOT_GID;
+
+
+        add_uevent_var(env, "MAJOR=%u", MAJOR(dev->devt));
+        add_uevent_var(env, "MINOR=%u", MINOR(dev->devt));
+        name = device_get_devnode(dev, &mode, &uid, &gid, &tmp);
+        if (name) {
+            add_uevent_var(env, "DEVNAME=%s", name);
+            if (mode)
+                add_uevent_var(env, "DEVMODE=%#o", mode & 0777);
+            if (!uid_eq(uid, GLOBAL_ROOT_UID))
+                add_uevent_var(env, "DEVUID=%u", from_kuid(&init_user_ns, uid));
+            if (!gid_eq(gid, GLOBAL_ROOT_GID))
+                add_uevent_var(env, "DEVGID=%u", from_kgid(&init_user_ns, gid));
+            kfree(tmp);
+        }
+    }
+
+
+    if (dev->type && dev->type->name)
+        add_uevent_var(env, "DEVTYPE=%s", dev->type->name);
+
+
+    if (dev->driver)
+        add_uevent_var(env, "DRIVER=%s", dev->driver->name);
+
+
+    /* Add common DT information about the device */
+    of_device_uevent(dev, env);
+
+
+    /* have the bus specific function add its stuff */
+    if (dev->bus && dev->bus->uevent) {
+        retval = dev->bus->uevent(dev, env);
+        if (retval)
+            pr_debug("device: '%s': %s: bus uevent() returned %d\n",
+                 dev_name(dev), __func__, retval);
+    }
+
+
+    /* have the class specific function add its stuff */
+    if (dev->class && dev->class->dev_uevent) {
+        retval = dev->class->dev_uevent(dev, env);
+        if (retval)
+            pr_debug("device: '%s': %s: class uevent() "
+                 "returned %d\n", dev_name(dev),
+                 __func__, retval);
+    }
+
+
+    /* have the device type specific function add its stuff */
+    if (dev->type && dev->type->uevent) {
+        retval = dev->type->uevent(dev, env);
+        if (retval)
+            pr_debug("device: '%s': %s: dev_type uevent() "
+                 "returned %d\n", dev_name(dev),
+                 __func__, retval);
+    }
+
+
+    return retval;
+}
+```
+
+1. 继续添加环境变量到env buffer，包括主次设备号，device type name， device driver name...，从设备树获取相关环境变量
+2. 依次调用dev->bus->uevent， dev->class->dev_uevent，dev->type->uevent这些回调函数也是向env添加环境变量，以platform bus为例，dev->bus->uevent为platform_uevent：
+
+```cpp
+//drives/base/platform.c
+static int platform_uevent(struct device *dev, struct kobj_uevent_env *env)
+{
+	struct platform_device	*pdev = to_platform_device(dev);
+	int rc;
+
+	/* Some devices have extra OF data and an OF-style MODALIAS */
+	rc = of_device_uevent_modalias(dev, env);//从设备树解析环境变量
+	if (rc != -ENODEV)
+		return rc;
+
+	rc = acpi_device_uevent_modalias(dev, env);
+	if (rc != -ENODEV)
+		return rc;
+
+	add_uevent_var(env, "MODALIAS=%s%s", PLATFORM_MODULE_PREFIX,
+			pdev->name);//添加环境变量
+	return 0;
+}
+```
+
+## 总结：
+
+设备模型的uevent机制，用于向用户层发送一个uevent消息。内核提供的底层发送uevent的函数为kobject_uevent/kobject_uevent_env。这些函数一般会被内嵌到其他通过的框架或接口中如设备模型device和device_add函数，当使用device_add向内核注册一个设备时，会在device_add中调用kobject_uevent函数。
+
+在kobject_uevent函数中，会执行来自kset的uevent_ops的过滤，取名和uevent函数，以device_uevent为例，会添加设备主次设备号和一些和device相关的环境变量，随后还会执行device->bus,device->class,device->type的uevent函数，添加一些与bus/class/type有关的环境变量，最后kobject_uevent会通过执行uevent_helper中保存的用户空间程序解析环境变量并根据环境变量执行一些操作，uevent_helper通常为/sbin/hotplug   /sbin/mdev  /sbin/udev等程序，可以通过sysfs文件系统的/sys/kernel/uevent_helper属性文件修改uevent_helper中保存的程序。
+
+uevent_helper的内容是由内核配置项CONFIG_UEVENT_HELPER_PATH(位于./drivers/base/Kconfig)决定的，这个值通常被设置成/sbin/hotplug或者空？
+
+
+
+
+
+
+
