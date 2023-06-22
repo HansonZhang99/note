@@ -722,6 +722,3 @@ out_err_silent:
 
 
 
-`i2c_register_adapter`中为`adapter`调用了`device_register`，后面又为`client`调用了`device_register`。
-
-前面的`platform_device`和`platform_driver`

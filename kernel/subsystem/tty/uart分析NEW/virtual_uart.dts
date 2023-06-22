@@ -1,0 +1,8 @@
+/{
+	virtual_uart:virtual_uart{
+		compatible = "virtual_uart";
+		interrupt-parent = <&intc>;
+		interrupts = <GIC_SPI 99 IRQ_TYPE_LEVEL_HIGH>;
+		
+	};
+}
